@@ -4,6 +4,7 @@
 *.dll
 *.so
 *.dylib
+/k8s-secret-injector
 
 # Test binary, build with `go test -c`
 *.test

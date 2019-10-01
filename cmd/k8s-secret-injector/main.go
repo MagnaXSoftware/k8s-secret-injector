@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/spf13/pflag"
 	"k8s.io/klog"
+	"magnax.ca/k8s-secret-injector/internal/injector"
 	"magnax.ca/k8s-secret-injector/internal/kube"
 	"magnax.ca/k8s-secret-injector/internal/replicator"
 	"magnax.ca/k8s-secret-injector/internal/util"
@@ -70,8 +71,10 @@ func main() {
 	}()
 
 	replicatorApp := replicator.NewReplicator(conf, kubeclient)
+	injectorApp := injector.NewInjector(conf)
 
 	go replicatorApp.Run(exitChan)
+	go injectorApp.Run(exitChan)
 
 	select {
 	case <-exitChan:

@@ -10,6 +10,7 @@ import (
 	"magnax.ca/k8s-secret-injector/version"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 )
 
@@ -24,22 +25,26 @@ func parseFlags(args []string) (bool, *util.Configuration, error) {
 	flags.StringVar(&conf.KubeconfigFile, "kubeconfig", "", "path to the kubeconfig file")
 
 	flags.StringVar(&conf.WatchedNamespace, "namespace", "default", "Namespace of the source secret")
-	flags.StringVar(&conf.WatchedSecret, "secret", "", "Name of the source secret")
+	flags.StringVar(&conf.WatchedSecretName, "secret", "", "Name of the source secret")
 
 	flags.StringSliceVar(&conf.TargetNamespaces, "target-namespaces", []string{}, "Namespace(s) where the secret should be replicated, comma-separated. leave blank for all")
-	flags.StringVar(&conf.TargetTemplate, "target-template", "", "Template to use when generating the replicated secret names, leave blank for a generated template")
+	flags.StringVar(&conf.TargetNameTemplate, "target-template", "", "Template to use when generating the replicated secret names, leave blank for a generated template")
 
-	if *showVersion {
-		return true, nil, nil
-	}
+	noClean := flags.Bool("no-clean", false,"Do not clean namespaces of the created secrets")
 
 	if err := flags.Parse(args); err != nil {
 		return false, nil, err
 	}
 
-	if conf.WatchedSecret == "" || conf.WatchedNamespace == "" {
+	if *showVersion {
+		return true, nil, nil
+	}
+
+	if conf.WatchedSecretName == "" || conf.WatchedNamespace == "" {
 		return false, nil, fmt.Errorf("both the source namespace and secret must be specified")
 	}
+
+	conf.CleanNamespaces = !*noClean
 
 	return false, conf, nil
 }
@@ -60,22 +65,24 @@ func main() {
 		klog.Fatal(err)
 	}
 
-	exitChan := make(chan bool)
+	quit := make(chan bool)
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigs
-		close(exitChan)
+		close(quit)
 	}()
 
+	wg := sync.WaitGroup{}
 	replicatorApp := replicator.NewReplicator(conf, kubeclient)
 
-	go replicatorApp.Run(exitChan)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		replicatorApp.Run(quit)
+	}()
 
-	select {
-	case <-exitChan:
-	}
-
+	wg.Wait()
 	klog.Info("exiting")
 }

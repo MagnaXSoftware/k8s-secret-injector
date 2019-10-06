@@ -27,22 +27,22 @@ type Replicator struct {
 	targetSecretMutex  sync.RWMutex
 	cleanTargetSecrets bool
 
-	wg       sync.WaitGroup
-	quitChan chan bool
+	wg   sync.WaitGroup
+	quit chan bool
 }
 
 func NewReplicator(conf *util.Configuration, clientset *kubernetes.Clientset) *Replicator {
 	r := &Replicator{
-		KubeClient:     clientset,
-		Namespace:      conf.WatchedNamespace,
-		SecretName:     conf.WatchedSecret,
-		TargetTemplate: conf.TargetTemplate,
+		KubeClient:         clientset,
+		Namespace:          conf.WatchedNamespace,
+		SecretName:         conf.WatchedSecretName,
+		TargetTemplate:     conf.TargetNameTemplate,
+		cleanTargetSecrets: conf.CleanNamespaces,
 
-		quitChan:           make(chan bool, 0),
-		Targets:            map[string]bool{},
-		targetSyncerChans:  map[string]chan bool{},
-		TargetSecretName:   map[string]string{},
-		cleanTargetSecrets: true,
+		quit:              make(chan bool, 0),
+		Targets:           map[string]bool{},
+		targetSyncerChans: map[string]chan bool{},
+		TargetSecretName:  map[string]string{},
 	}
 
 	if len(conf.TargetNamespaces) != 0 {
@@ -58,8 +58,8 @@ func NewReplicator(conf *util.Configuration, clientset *kubernetes.Clientset) *R
 	return r
 }
 
-func (r *Replicator) Run(exitChan chan bool) {
-	defer r.Cleanup()
+func (r *Replicator) Run(exit chan bool) {
+	defer r.cleanup()
 
 	r.wg.Add(1)
 	go r.secretWatcher()
@@ -68,10 +68,10 @@ func (r *Replicator) Run(exitChan chan bool) {
 	go r.namespaceWatcher()
 
 	select {
-	case <-r.quitChan:
-		close(exitChan)
-	case <-exitChan:
-		close(r.quitChan)
+	case <-r.quit:
+		close(exit)
+	case <-exit:
+		close(r.quit)
 	}
 }
 
@@ -91,10 +91,11 @@ func (r *Replicator) secretWatcher() {
 			if !ok {
 				continue
 			}
-			klog.Infof("received new secret: %v", secret.Name)
+			klog.Infof("receive new secret event for %v", secret.Name)
 			if secret.Name != r.SecretName {
 				continue
 			}
+
 			switch event.Type {
 			case watch.Added:
 				fallthrough
@@ -105,7 +106,9 @@ func (r *Replicator) secretWatcher() {
 
 					r.contentBuffer = secret.Data
 				}()
-				r.notifySyncers()
+				for _, ch := range r.targetSyncerChans {
+					ch <- true
+				}
 			case watch.Deleted:
 				klog.Errorf("watched secret %s/%s has been deleted, synchronisation has been suspended.", r.Namespace, r.SecretName)
 			case watch.Bookmark:
@@ -114,15 +117,9 @@ func (r *Replicator) secretWatcher() {
 				klog.Fatal("error occured while watching, exiting")
 			}
 			continue
-		case <-r.quitChan:
+		case <-r.quit:
 			return
 		}
-	}
-}
-
-func (r *Replicator) notifySyncers() {
-	for _, ch := range r.targetSyncerChans {
-		ch <- true
 	}
 }
 
@@ -147,6 +144,7 @@ func (r *Replicator) namespaceWatcher() {
 				// if we have target namespaces and it is not listed in the map, skip it.
 				continue
 			}
+
 			switch event.Type {
 			case watch.Added:
 				if _, ok := r.targetSyncerChans[namespace.Name]; ok {
@@ -155,7 +153,7 @@ func (r *Replicator) namespaceWatcher() {
 				}
 				r.targetSyncerChans[namespace.Name] = make(chan bool, 1)
 				r.wg.Add(1)
-				go syncNamespace(r, namespace)
+				go r.syncNamespace(namespace)
 				r.targetSyncerChans[namespace.Name] <- true
 			case watch.Modified:
 				// do nothing here
@@ -166,16 +164,16 @@ func (r *Replicator) namespaceWatcher() {
 			case watch.Bookmark:
 				// do nothing here
 			case watch.Error:
-				klog.Fatal("error occured while watching, exiting")
+				klog.Fatal("error occurred while watching, exiting")
 			}
 			continue
-		case <-r.quitChan:
+		case <-r.quit:
 			return
 		}
 	}
 }
 
-func syncNamespace(r *Replicator, namespace *v1.Namespace) {
+func (r *Replicator) syncNamespace(namespace *v1.Namespace) {
 	defer r.wg.Done()
 
 	first := true
@@ -188,16 +186,19 @@ func syncNamespace(r *Replicator, namespace *v1.Namespace) {
 				klog.Infof("stopping sync on namespace %v", namespace.Name)
 				break
 			}
-			r.targetSecretMutex.RLock()
-			name, ok := r.TargetSecretName[namespace.Name]
-			r.targetSecretMutex.RUnlock()
-			if !ok {
-				name = fmt.Sprintf("%v%08x", r.TargetTemplate, crc32.ChecksumIEEE([]byte(namespace.Name)))
-				r.targetSecretMutex.Lock()
-				r.TargetSecretName[namespace.Name] = name
-				r.targetSecretMutex.Unlock()
-				klog.Infof("syncing to secret %v/%v", namespace.Name, name)
-			}
+			name := func() string {
+				r.targetSecretMutex.RLock()
+				name, ok := r.TargetSecretName[namespace.Name]
+				r.targetSecretMutex.RUnlock()
+				if !ok {
+					name = fmt.Sprintf("%v%08x", r.TargetTemplate, crc32.ChecksumIEEE([]byte(namespace.Name)))
+					r.targetSecretMutex.Lock()
+					r.TargetSecretName[namespace.Name] = name
+					r.targetSecretMutex.Unlock()
+					klog.Infof("syncing to secret %v/%v", namespace.Name, name)
+				}
+				return name
+			}()
 			r.contentRWMutex.RLock()
 			secret := &v1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
@@ -208,6 +209,7 @@ func syncNamespace(r *Replicator, namespace *v1.Namespace) {
 				Data: r.contentBuffer,
 			}
 			if first {
+				// We try to create the secret on the first loop.
 				_, _ = r.KubeClient.CoreV1().Secrets(namespace.Name).Create(secret)
 				first = false
 			}
@@ -217,13 +219,13 @@ func syncNamespace(r *Replicator, namespace *v1.Namespace) {
 			}
 
 			r.contentRWMutex.RUnlock()
-		case <-r.quitChan:
+		case <-r.quit:
 			return
 		}
 	}
 }
 
-func (r *Replicator) Cleanup() {
+func (r *Replicator) cleanup() {
 	r.wg.Wait()
 
 	if r.cleanTargetSecrets {

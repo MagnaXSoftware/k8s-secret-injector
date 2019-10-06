@@ -5,8 +5,9 @@ type Configuration struct {
 	ApiserverHost  string
 	KubeconfigFile string
 
-	WatchedNamespace string
-	WatchedSecret    string
-	TargetNamespaces []string
-	TargetTemplate   string
+	WatchedSecretName  string
+	WatchedNamespace   string
+	TargetNameTemplate string
+	TargetNamespaces   []string
+	CleanNamespaces    bool
 }

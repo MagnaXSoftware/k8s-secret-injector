@@ -10,7 +10,11 @@ import (
 	"k8s.io/klog"
 	"magnax.ca/k8s-secret-injector/internal/util"
 	"sync"
+	"time"
 )
+
+const TopicContentUpdate = "content-update"
+const TopicNamespaceDelete = "namespace.delete"
 
 type Replicator struct {
 	KubeClient     *kubernetes.Clientset
@@ -22,7 +26,6 @@ type Replicator struct {
 	contentBuffer  map[string][]byte
 	contentRWMutex sync.RWMutex
 
-	targetSyncerChans  map[string]chan bool
 	TargetSecretName   map[string]string
 	targetSecretMutex  sync.RWMutex
 	cleanTargetSecrets bool
@@ -39,10 +42,9 @@ func NewReplicator(conf *util.Configuration, clientset *kubernetes.Clientset) *R
 		TargetTemplate:     conf.TargetNameTemplate,
 		cleanTargetSecrets: conf.CleanNamespaces,
 
-		quit:              make(chan bool, 0),
-		Targets:           map[string]bool{},
-		targetSyncerChans: map[string]chan bool{},
-		TargetSecretName:  map[string]string{},
+		quit:             make(chan bool, 0),
+		Targets:          map[string]bool{},
+		TargetSecretName: map[string]string{},
 	}
 
 	if len(conf.TargetNamespaces) != 0 {
@@ -91,24 +93,18 @@ func (r *Replicator) secretWatcher() {
 			if !ok {
 				continue
 			}
-			klog.Infof("receive new secret event for %v", secret.Name)
+			klog.Infof("received event for secret %s: %v", secret.Name, event.Type)
 			if secret.Name != r.SecretName {
 				continue
 			}
 
 			switch event.Type {
-			case watch.Added:
-				fallthrough
-			case watch.Modified:
-				func() {
-					r.contentRWMutex.Lock()
-					defer r.contentRWMutex.Unlock()
+			case watch.Added, watch.Modified:
+				r.contentRWMutex.Lock()
+				r.contentBuffer = secret.Data
+				r.contentRWMutex.Unlock()
 
-					r.contentBuffer = secret.Data
-				}()
-				for _, ch := range r.targetSyncerChans {
-					ch <- true
-				}
+				util.Publish(TopicContentUpdate, time.Now())
 			case watch.Deleted:
 				klog.Errorf("watched secret %s/%s has been deleted, synchronisation has been suspended.", r.Namespace, r.SecretName)
 			case watch.Bookmark:
@@ -139,7 +135,7 @@ func (r *Replicator) namespaceWatcher() {
 			if !ok {
 				continue
 			}
-			klog.Infof("received new namespace: %v", namespace.Name)
+			klog.Infof("received event for namespace %s: %v", namespace.Name, event.Type)
 			if len(r.Targets) > 0 && !r.Targets[namespace.Name] {
 				// if we have target namespaces and it is not listed in the map, skip it.
 				continue
@@ -147,21 +143,12 @@ func (r *Replicator) namespaceWatcher() {
 
 			switch event.Type {
 			case watch.Added:
-				if _, ok := r.targetSyncerChans[namespace.Name]; ok {
-					klog.Warning("received Added event for namespace %v, but we are already syncing the namespace", namespace.Name)
-					continue
-				}
-				r.targetSyncerChans[namespace.Name] = make(chan bool, 1)
 				r.wg.Add(1)
 				go r.syncNamespace(namespace)
-				r.targetSyncerChans[namespace.Name] <- true
-			case watch.Modified:
-				// do nothing here
 			case watch.Deleted:
 				klog.Infof("removing syncer for namespace %v", namespace.Name)
-				close(r.targetSyncerChans[namespace.Name])
-				delete(r.targetSyncerChans, namespace.Name)
-			case watch.Bookmark:
+				util.Publish(TopicNamespaceDelete, namespace.Name)
+			case watch.Modified, watch.Bookmark:
 				// do nothing here
 			case watch.Error:
 				klog.Fatal("error occurred while watching, exiting")
@@ -176,53 +163,68 @@ func (r *Replicator) namespaceWatcher() {
 func (r *Replicator) syncNamespace(namespace *v1.Namespace) {
 	defer r.wg.Done()
 
-	first := true
+	var first sync.Once
+	nsName := namespace.Name
 
-	ch := r.targetSyncerChans[namespace.Name]
-	for {
-		select {
-		case _, open := <-ch:
-			if !open {
-				klog.Infof("stopping sync on namespace %v", namespace.Name)
-				break
+	doUpdate := func() {
+		name := func() string {
+			r.targetSecretMutex.RLock()
+			name, ok := r.TargetSecretName[nsName]
+			r.targetSecretMutex.RUnlock()
+			if !ok {
+				name = fmt.Sprintf("%v%08x", r.TargetTemplate, crc32.ChecksumIEEE([]byte(nsName)))
+				r.targetSecretMutex.Lock()
+				r.TargetSecretName[nsName] = name
+				r.targetSecretMutex.Unlock()
+				klog.Infof("syncing to secret %v/%v", nsName, name)
 			}
-			name := func() string {
-				r.targetSecretMutex.RLock()
-				name, ok := r.TargetSecretName[namespace.Name]
-				r.targetSecretMutex.RUnlock()
-				if !ok {
-					name = fmt.Sprintf("%v%08x", r.TargetTemplate, crc32.ChecksumIEEE([]byte(namespace.Name)))
-					r.targetSecretMutex.Lock()
-					r.TargetSecretName[namespace.Name] = name
-					r.targetSecretMutex.Unlock()
-					klog.Infof("syncing to secret %v/%v", namespace.Name, name)
-				}
-				return name
-			}()
-			r.contentRWMutex.RLock()
-			secret := &v1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      name,
-					Namespace: namespace.Name,
-					Labels:    map[string]string{"managed-by-injector": "true"},
-				},
-				Data: r.contentBuffer,
-			}
-			if first {
-				// We try to create the secret on the first loop.
-				_, _ = r.KubeClient.CoreV1().Secrets(namespace.Name).Create(secret)
-				first = false
-			}
-			_, err := r.KubeClient.CoreV1().Secrets(namespace.Name).Update(secret)
-			if err != nil {
-				klog.Errorf("error while updating secret %s/%s %v", namespace.Name, name, err)
-			}
+			return name
+		}()
 
-			r.contentRWMutex.RUnlock()
-		case <-r.quit:
-			return
+		r.contentRWMutex.RLock()
+		defer r.contentRWMutex.RUnlock()
+
+		secret := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: nsName,
+				Labels:    map[string]string{"managed-by-injector": "true"},
+			},
+			Data: r.contentBuffer,
+		}
+		first.Do(func() { _, _ = r.KubeClient.CoreV1().Secrets(nsName).Create(secret) })
+		_, err := r.KubeClient.CoreV1().Secrets(nsName).Update(secret)
+		if err != nil {
+			klog.Errorf("error while updating secret %s/%s %v", nsName, name, err)
 		}
 	}
+
+	// Do an update on creation to initialize the secret.
+	doUpdate()
+
+	ch := make(chan util.Event)
+	unsubContent := util.Subscribe(TopicContentUpdate, ch)
+	unsubNamespace := util.Subscribe(TopicNamespaceDelete, ch)
+	for {
+		select {
+		case event := <-ch:
+			switch event.Topic {
+			case TopicContentUpdate:
+				doUpdate()
+			case TopicNamespaceDelete:
+				if name, ok := event.Message.(string); ok && name == nsName {
+					goto exit
+				}
+			}
+		case <-r.quit:
+			goto exit
+		}
+	}
+
+exit:
+	unsubContent()
+	unsubNamespace()
+	close(ch)
 }
 
 func (r *Replicator) cleanup() {

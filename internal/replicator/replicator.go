@@ -213,6 +213,9 @@ func (r *Replicator) syncNamespace(namespace *v1.Namespace) {
 				doUpdate()
 			case TopicNamespaceDelete:
 				if name, ok := event.Message.(string); ok && name == nsName {
+					r.targetSecretMutex.Lock()
+					delete(r.TargetSecretName, nsName)
+					r.targetSecretMutex.Unlock()
 					goto exit
 				}
 			}

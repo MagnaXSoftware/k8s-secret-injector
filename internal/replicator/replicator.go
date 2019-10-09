@@ -234,7 +234,7 @@ func (r *Replicator) cleanup() {
 		for ns, name := range r.TargetSecretName {
 			err := r.KubeClient.CoreV1().Secrets(ns).Delete(name, &metav1.DeleteOptions{})
 			if err != nil {
-				klog.Error("error while deleting %s/%s: %v", ns, name, err)
+				klog.Errorf("error while deleting %s/%s: %v", ns, name, err)
 			}
 		}
 	}
